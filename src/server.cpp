@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <stdio.h>
+#include <sys/fcntl.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -8,6 +9,7 @@
 
 #include <array>
 #include <cstring>
+#include <iostream>
 
 #include "sockutils.hpp"
 
@@ -21,9 +23,9 @@ int get_listener_socket() {
   int listener_fd;
 
   // Get the list of possible server addresses to use (we use the first one)
-  auto [server_addresses, err_code] = get_address(nullptr, PORT);
+  const auto [server_addresses, err_code] = get_address(nullptr, PORT);
   if (err_code != 0) {
-    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err_code));
+    std::cerr << "getaddrinfo:" << gai_strerror(err_code) << '\n';
     return -1;
   }
 
@@ -36,12 +38,18 @@ int get_listener_socket() {
       continue;
     }
 
-    int should_reuse = 1;
-    if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &should_reuse,
-                   sizeof(should_reuse)) == -1) {
+    constexpr int non_blocking_reusable = 1;
+    if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR,
+                   &non_blocking_reusable,
+                   sizeof(non_blocking_reusable)) == -1) {
       perror("setsockopt");
       close(listener_fd);
       continue;
+    }
+    if (fcntl(listener_fd, O_NONBLOCK, &non_blocking_reusable)) {
+      perror("fcntl");
+      close(listener_fd);
+      exit(-1);
     }
 
     if (bind(listener_fd, it->ai_addr, it->ai_addrlen) == -1) {
@@ -56,7 +64,7 @@ int get_listener_socket() {
   freeaddrinfo(server_addresses);
 
   if (it == nullptr) {
-    fprintf(stderr, "failed to create/bind the socket");
+    std::cerr << "failed to create/bind the socket\n";
     return -1;
   }
 
@@ -84,23 +92,30 @@ int main(void) {
 
   // File descriptors of all used sockets
   std::array<pollfd, 10> fd_poll;
+  fd_poll.fill({.fd = -1});
   fd_poll[0] = {.fd = listener_fd, .events = POLLIN};
   size_t n_socks = 1;
 
   while (true) {
-    int n_events = poll(fd_poll.data(), n_socks, 5000);
+    int n_events = poll(fd_poll.data(), n_socks, 10000);
     if (n_events == -1) {
       perror("poll");
       exit(1);
     }
     if (n_events == 0) {
-      printf("polt() timeout, waiting for events...\n");
+      std::cout << "poll() timeout, waiting for events...\n";
       continue;
     }
     for (auto& sock : fd_poll) {
       if (sock.revents == 0) continue;
+      if (sock.revents & POLLHUP) {
+        close(sock.fd);
+        std::cerr << "client hanged up, closing their socket\n";
+        sock.fd = -1;
+        break;
+      }
       if (sock.revents != POLLIN) {
-        fprintf(stderr, "unexpected event: %d\n", sock.revents);
+        std::cerr << "unexpected event: " << sock.revents << '\n';
         break;
       }
 
@@ -116,13 +131,13 @@ int main(void) {
         fd_poll[n_socks++].events = POLLIN;
         inet_ntop(client.ss_family, get_sinaddr(&client), client_addr,
                   sizeof(client_addr));
-        printf("connected: %s\n", client_addr);
+        std::cout << "connected: " << client_addr << '\n';
       } else {
         int bytes_received;
         char data_buffer[128];
         bool close_connection = false;
         size_t str_len;
-        do {
+        while (true) {
           bytes_received = recv(sock.fd, data_buffer, sizeof(data_buffer), 0);
           if (bytes_received < 0) {
             if (errno != EWOULDBLOCK) {
@@ -132,19 +147,24 @@ int main(void) {
             break;
           }
           if (bytes_received == 0) {
-            printf("Connection closed\n");
+            std::cout << "Connection closed\n";
             close_connection = true;
             break;
           }
           str_len = bytes_received;
-          printf("%lu bytes received from client\n", str_len);
-          bytes_received = send(sock.fd, data_buffer, str_len, 0);
-          if (bytes_received < 0) {
-            perror("send");
-            close_connection = true;
-            break;
+          std::cout << str_len << " bytes received from client\n";
+          for (auto& sock : fd_poll) {
+            if (sock.fd != listener_fd && sock.fd != -1) {
+              bytes_received = send(sock.fd, data_buffer, str_len, 0);
+              std::cout << "sent " << data_buffer << '\n';
+              if (bytes_received < 0) {
+                perror("send");
+                close_connection = true;
+                break;
+              }
+            }
           }
-        } while (true);
+        }
         if (close_connection) {
           close(sock.fd);
           sock.fd = -1;

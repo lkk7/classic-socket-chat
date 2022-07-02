@@ -5,11 +5,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/fcntl.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <array>
+#include <iostream>
+
 #include "sockutils.hpp"
+#include "unistd.h"
 
 #define PORT "12321"
 #define MAXDATASIZE 100
@@ -21,6 +27,7 @@
  */
 int server_connect(addrinfo* addresses) {
   int connection_fd;
+  constexpr int non_blocking = 1;
   addrinfo* it = nullptr;
   // loop over the addresses to find the first one available to use
   for (it = addresses; it != nullptr; it = it->ai_next) {
@@ -35,9 +42,15 @@ int server_connect(addrinfo* addresses) {
       close(connection_fd);
       continue;
     }
+
+    if (fcntl(connection_fd, O_NONBLOCK, &non_blocking)) {
+      perror("fcntl");
+      close(connection_fd);
+      exit(-1);
+    }
     return connection_fd;
   }
-  fprintf(stderr, "failed to connect the socket");
+  std::cerr << "failed to connect the socket\n";
   return -1;
 }
 
@@ -51,7 +64,7 @@ int get_connection(const char* addr) {
   // Get the list of possible server addresses to use (we use the first one)
   auto [server_addresses, err_code] = get_address(addr, PORT);
   if (err_code != 0) {
-    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err_code));
+    std::cerr << "getaddrinfo:" << gai_strerror(err_code) << '\n';
     return -1;
   }
 
@@ -69,18 +82,18 @@ int get_connection(const char* addr) {
  */
 int receive_bytes(int socket_fd, char buffer[], size_t buf_size) {
   int bytes_received = recv(socket_fd, buffer, buf_size - 1, 0);
-  if (bytes_received == -1) {
+  if (bytes_received == -1 && errno != EAGAIN) {
     perror("recv");
     return -1;
   }
-  printf("received '%s'\n", buffer);
+  if (*buffer) std::cout << "received: " << buffer << '\n';
   buffer[bytes_received] = '\0';
   return bytes_received;
 }
 
 int main(int argc, char* argv[]) {
   if (argc != 2) {
-    fprintf(stderr, "usage: client <hostname>\n");
+    std::cerr << "usage: client <hostname>\n";
     exit(1);
   }
 
@@ -89,18 +102,49 @@ int main(int argc, char* argv[]) {
     exit(1);
   }
 
-  char buffer[MAXDATASIZE] = "Test message!";
-  int bytes_sent = send(connection_fd, buffer, MAXDATASIZE, 0);
-  if (bytes_sent < 0) {
-    perror("send");
-    exit(1);
+  // File descriptors of all used sockets
+  constexpr int POLL_SIZE = 2;
+  std::array<pollfd, POLL_SIZE> fd_poll{
+      {{STDIN_FILENO, POLLIN, 0}, {connection_fd, POLLIN, 0}}};
+
+  char buffer[MAXDATASIZE];
+  std::string input;
+
+  bool quit = false;
+  while (!quit) {
+    int n_events = poll(fd_poll.data(), POLL_SIZE, 10000);
+    if (n_events == -1) {
+      perror("poll");
+      exit(1);
+    }
+    if (n_events == 0) continue;
+    for (auto& sock : fd_poll) {
+      if (sock.revents == 0) continue;
+      if (sock.revents != POLLIN) {
+        std::cerr << "unexpected event: " << sock.revents << '\n';
+        quit = true;
+        break;
+      }
+      if (sock.fd == connection_fd) {
+        int bytes_received = 0;
+        while (true) {
+          bytes_received = receive_bytes(connection_fd, buffer, MAXDATASIZE);
+          if (bytes_received == -1) {
+            break;
+          }
+        }
+      } else {
+        // It's stdin, not the connection socket
+        std::string input;
+        std::cin >> input;
+        int bytes_sent = send(connection_fd, input.c_str(), MAXDATASIZE, 0);
+        if (bytes_sent < 0) {
+          perror("send");
+          quit = true;
+        }
+      }
+    }
   }
-  printf("Sent %d bytes\n", bytes_sent);
-  int bytes_received = receive_bytes(connection_fd, buffer, MAXDATASIZE);
-  if (bytes_received == -1) {
-    exit(1);
-  }
-  printf("Received %d bytes\n", bytes_received);
 
   close(connection_fd);
 
