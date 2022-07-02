@@ -1,26 +1,28 @@
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <stdio.h>
 #include <sys/fcntl.h>
-#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <array>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 
 #include "sockutils.hpp"
 
-#define PORT "12321"
-#define BACKLOG 100
-
+/**
+ * @brief Attempt to create a listener socket with correct settings
+ * and return its file descriptor.
+ * @return file descriptor of the listener socket or -1 on error.
+ */
 int get_listener_socket() {
   // iterator used for choosing the first right server info from getaddrinfo()
   addrinfo* it = nullptr;
   // file descriptor of the listener socket
-  int listener_fd;
+  int listener_fd = 0;
+  constexpr int REUSABLE = 1;
+  constexpr int NON_BLOCKING = 1;
 
   // Get the list of possible server addresses to use (we use the first one)
   const auto [server_addresses, err_code] = get_address(nullptr, PORT);
@@ -38,15 +40,14 @@ int get_listener_socket() {
       continue;
     }
 
-    constexpr int non_blocking_reusable = 1;
-    if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR,
-                   &non_blocking_reusable,
-                   sizeof(non_blocking_reusable)) == -1) {
+    if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &REUSABLE,
+                   sizeof(REUSABLE)) == -1) {
       perror("setsockopt");
       close(listener_fd);
       continue;
     }
-    if (fcntl(listener_fd, O_NONBLOCK, &non_blocking_reusable)) {
+
+    if (fcntl(listener_fd, O_NONBLOCK, &NON_BLOCKING) != 0) {
       perror("fcntl");
       close(listener_fd);
       exit(-1);
@@ -68,7 +69,7 @@ int get_listener_socket() {
     return -1;
   }
 
-  if (listen(listener_fd, BACKLOG) == -1) {
+  if (listen(listener_fd, LISTENER_BACKLOG) == -1) {
     perror("listen");
     return -1;
   }
@@ -76,28 +77,130 @@ int get_listener_socket() {
   return listener_fd;
 }
 
-int main(void) {
-  int listener_fd = get_listener_socket();
-  if (listener_fd == -1) {
-    return 1;
+/**
+ * @brief Put bytes coming from a socket into a buffer.
+ * @param sock socket to read from
+ * @param data_buffer char buffer to receive byte
+ * @param conn_map map of addresses based on file descriptors
+ * @return message received or "" on error, or "\nblock" on EWOULDBLOCK.
+ */
+std::string receive_message(const pollfd& sock, char data_buffer[],
+                            const address_map& conn_map) {
+  ssize_t bytes_received = recv(sock.fd, data_buffer, BUF_BYTES_SIZE, 0);
+  if (bytes_received < 0) {
+    if (errno != EWOULDBLOCK) {
+      perror("recv");
+      return "";
+    }
+    return "\nblock";
   }
+  if (bytes_received == 0) {
+    std::cout << "connection closed\n";
+    return "";
+  }
+  std::cout << bytes_received << " bytes received from " << '[' << sock.fd
+            << ']' << conn_map.at(sock.fd) << "\n";
 
-  // file descriptor of the actual connection
-  int connection_fd;
+  return encode_server_msg(sock.fd, conn_map.at(sock.fd), (char*)data_buffer);
+}
 
-  // client info
-  sockaddr_storage client;
+/**
+ * @brief Send a message to all connected clients (except the listener socket).
+ * @param fd_poll the event poll
+ * @param listener_fd listener socket's file descriptor
+ * @param msg string message to send
+ * @param conn_map map of addresses based on file descriptors
+ * @return number of failed send attempts.
+ */
+int broadcast_message(const server_poll_arr& fd_poll, int listener_fd,
+                      const std::string& msg, address_map& conn_map) {
+  ssize_t bytes_sent = -1;
+  int bad_sends = 0;
+  for (const auto& sock : fd_poll) {
+    if (sock.fd != listener_fd && sock.fd != -1) {
+      bytes_sent = send(sock.fd, msg.c_str(), BUF_BYTES_SIZE, 0);
+      std::cout << "sent " << bytes_sent << " bytes to [" << sock.fd << ']'
+                << conn_map.at(sock.fd) << "\n";
+      if (bytes_sent < 0) {
+        perror("send");
+        bad_sends++;
+      }
+    }
+  }
+  return bad_sends;
+}
+
+/**
+ * @brief Handle an event on a the client's file descriptor (receive and
+ * broadcast the message).
+ * @param n_socks variable to increment on succesful client socket creation
+ * @param listener_fd listener socket's file descriptor
+ * @param fd_poll the event poll
+ * @param conn_map map of addresses based on file descriptors
+ * @return new client's file descriptor or -1 on error.
+ */
+int handle_listener_event(size_t& n_socks, int listener_fd,
+                          server_poll_arr& fd_poll, address_map& conn_map) {
+  // holds client information
+  sockaddr_storage client{};
   socklen_t client_size = sizeof(client);
   char client_addr[INET6_ADDRSTRLEN];
 
-  // File descriptors of all used sockets
-  std::array<pollfd, 10> fd_poll;
-  fd_poll.fill({.fd = -1});
-  fd_poll[0] = {.fd = listener_fd, .events = POLLIN};
+  int current_fd = accept(listener_fd, (sockaddr*)&client, &client_size);
+  if (current_fd < 0) {
+    if (errno != EWOULDBLOCK) {
+      perror("accept");
+    }
+    return -1;
+  }
+
+  fd_poll.at(n_socks).fd = current_fd;
+  fd_poll.at(n_socks++).events = POLLIN;
+  inet_ntop(client.ss_family, get_sinaddr(&client), client_addr, client_size);
+  conn_map.insert_or_assign(current_fd, client_addr);
+  std::cout << "connected: [" << current_fd << ']' << client_addr << '\n';
+
+  return current_fd;
+}
+
+/**
+ * @brief Handle an event on a the client's file descriptor (receive and
+ * broadcast the message).
+ * @param pollfd a socket with the event
+ * @param fd_poll the event poll
+ * @param listener_fd listener socket's file descriptor
+ * @param conn_map map of addresses based on file descriptors
+ * @return 0 on success, -1 on error.
+ */
+int handle_client_event(const pollfd& sock, const server_poll_arr& fd_poll,
+                        int listener_fd, address_map& conn_map) {
+  char data_buffer[BUF_BYTES_SIZE];
+  const auto msg = receive_message(sock, data_buffer, conn_map);
+  if (msg.empty()) {
+    return -1;
+  }
+  if (msg != "\nblock") {
+    const int bad_sends =
+        broadcast_message(fd_poll, listener_fd, msg, conn_map);
+    if (bad_sends > 1) {
+      return -1;
+    };
+  }
+  return 0;
+}
+
+/**
+ * @brief Handle poll events in a loop.
+ * @param fd_poll the event poll
+ * @param listener_fd listener socket's file descriptor
+ */
+void handle_events(server_poll_arr& fd_poll, int listener_fd) {
+  // utility connection map (file descriptor -> address)
+  address_map conn_map{};
   size_t n_socks = 1;
 
   while (true) {
-    int n_events = poll(fd_poll.data(), n_socks, 10000);
+    int n_events = poll(fd_poll.data(), n_socks, POLL_TIMEOUT);
     if (n_events == -1) {
       perror("poll");
       exit(1);
@@ -107,10 +210,12 @@ int main(void) {
       continue;
     }
     for (auto& sock : fd_poll) {
-      if (sock.revents == 0) continue;
-      if (sock.revents & POLLHUP) {
-        close(sock.fd);
+      if (sock.revents == 0) {
+        continue;
+      };
+      if ((sock.revents & POLLHUP) != 0) {
         std::cerr << "client hanged up, closing their socket\n";
+        close(sock.fd);
         sock.fd = -1;
         break;
       }
@@ -120,61 +225,38 @@ int main(void) {
       }
 
       if (sock.fd == listener_fd) {
-        connection_fd = accept(listener_fd, (sockaddr*)&client, &client_size);
-        if (connection_fd < 0) {
-          if (errno != EWOULDBLOCK) {
-            perror("accept");
-          }
-          break;
-        }
-        fd_poll[n_socks].fd = connection_fd;
-        fd_poll[n_socks++].events = POLLIN;
-        inet_ntop(client.ss_family, get_sinaddr(&client), client_addr,
-                  sizeof(client_addr));
-        std::cout << "connected: " << client_addr << '\n';
-      } else {
-        int bytes_received;
-        char data_buffer[128];
-        bool close_connection = false;
-        size_t str_len;
-        while (true) {
-          bytes_received = recv(sock.fd, data_buffer, sizeof(data_buffer), 0);
-          if (bytes_received < 0) {
-            if (errno != EWOULDBLOCK) {
-              perror("recv");
-              close_connection = true;
-            }
-            break;
-          }
-          if (bytes_received == 0) {
-            std::cout << "Connection closed\n";
-            close_connection = true;
-            break;
-          }
-          str_len = bytes_received;
-          std::cout << str_len << " bytes received from client\n";
-          for (auto& sock : fd_poll) {
-            if (sock.fd != listener_fd && sock.fd != -1) {
-              bytes_received = send(sock.fd, data_buffer, str_len, 0);
-              std::cout << "sent " << data_buffer << '\n';
-              if (bytes_received < 0) {
-                perror("send");
-                close_connection = true;
-                break;
-              }
-            }
-          }
-        }
-        if (close_connection) {
-          close(sock.fd);
-          sock.fd = -1;
-        }
+        // we're in the listener socket
+        handle_listener_event(n_socks, listener_fd, fd_poll, conn_map);
+        continue;
+      }
+      // we're listening to the client's socket
+      if (handle_client_event(sock, fd_poll, listener_fd, conn_map) < 0) {
+        close(sock.fd);
+        sock.fd = -1;
       }
     }
   }
+}
 
-  for (size_t i = 0; i < n_socks; i++) {
-    if (fd_poll[i].fd >= 0) close(fd_poll[i].fd);
+int main() {
+  int listener_fd = get_listener_socket();
+  if (listener_fd == -1) {
+    return 1;
+  }
+
+  // client info
+
+  // poll that handles events, the first entry is the listener socket
+  server_poll_arr fd_poll{};
+  fd_poll.fill({.fd = -1});
+  fd_poll.at(0) = {.fd = listener_fd, .events = POLLIN};
+
+  handle_events(fd_poll, listener_fd);
+
+  for (const auto& sock : fd_poll) {
+    if (sock.fd >= 0) {
+      close(sock.fd);
+    }
   }
   return 0;
 }
