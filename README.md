@@ -1,8 +1,8 @@
 # classic-socket-chat
 
-A primitive chat server that lets multiple clients connect to a server and chat.
-It's rather a quick proof of concept – this was just a way to refresh my knowledge about sockets and put it somewhere.
-A guide that helped me: [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/).
+A primitive chat server that allows multiple clients to chat together.\
+It's a quick proof of concept – this was just a way to refresh my knowledge about sockets and put it somewhere.\
+A guide that helped me: [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/).\
 It uses sockets and `poll()` to handle events – it's not suitable for Windows.
 
 - Not safe.
